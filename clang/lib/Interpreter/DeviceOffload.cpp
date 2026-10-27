@@ -13,9 +13,11 @@
 
 #include "DeviceOffload.h"
 
+#include "clang/Basic/TargetID.h"
 #include "clang/Basic/TargetOptions.h"
 #include "clang/CodeGen/BackendUtil.h"
 #include "clang/CodeGen/ModuleBuilder.h"
+#include "clang/Driver/OffloadBundler.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Interpreter/PartialTranslationUnit.h"
 
@@ -29,6 +31,8 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
+#include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
 
 namespace clang {
@@ -132,6 +136,73 @@ IncrementalHIPDeviceParser::GenerateHSACO(llvm::StringRef Object) {
   return llvm::StringRef(HSACOContent.data(), HSACOContent.size());
 }
 
+llvm::Expected<llvm::StringRef>
+IncrementalHIPDeviceParser::GenerateBundle(llvm::StringRef HSACO) {
+  static constexpr unsigned CodeObjectAlign = 4096;
+
+  // The device triple encodes the GPU, e.g. amdgpu11.00-amd-amdhsa, so the
+  // architecture is only given by the CPU when it was set explicitly.
+  llvm::Triple DeviceTriple(TargetOpts.Triple);
+  std::string Arch = TargetOpts.CPU;
+  if (Arch.empty())
+    Arch = llvm::AMDGPU::getArchNameAMDGCN(
+               llvm::AMDGPU::getGPUKindFromSubArch(DeviceTriple.getSubArch()))
+               .str();
+
+  // The bundle holds a dummy host entry and the device entry, named like the
+  // driver does it (see clang-linker-wrapper).
+  std::string HostID =
+      "host-" + llvm::Triple(llvm::sys::getProcessTriple()).normalize();
+  std::string DeviceID =
+      "hip-" + normalizeForBundler(DeviceTriple, Arch) + "-" + Arch;
+
+  llvm::SmallString<128> HostFile;
+  if (llvm::sys::fs::createTemporaryFile("hip-host", "", HostFile))
+    return llvm::make_error<llvm::StringError>(
+        "Failed to create a temporary host bundle input.",
+        llvm::inconvertibleErrorCode());
+  llvm::FileRemover HostRemover(HostFile);
+
+  int DeviceFD = -1;
+  llvm::SmallString<128> DeviceFile;
+  if (llvm::sys::fs::createTemporaryFile("hip-device", "hsaco", DeviceFD,
+                                         DeviceFile))
+    return llvm::make_error<llvm::StringError>(
+        "Failed to create a temporary code object file.",
+        llvm::inconvertibleErrorCode());
+  llvm::FileRemover DeviceRemover(DeviceFile);
+  {
+    llvm::raw_fd_ostream OS(DeviceFD, /*shouldClose=*/true);
+    OS << HSACO;
+  }
+
+  llvm::SmallString<128> BundleFile;
+  if (llvm::sys::fs::createTemporaryFile("hip-bundle", "hipfb", BundleFile))
+    return llvm::make_error<llvm::StringError>(
+        "Failed to create a temporary offload bundle file.",
+        llvm::inconvertibleErrorCode());
+  llvm::FileRemover BundleRemover(BundleFile);
+
+  OffloadBundlerConfig Config;
+  Config.FilesType = "o";
+  Config.BundleAlignment = CodeObjectAlign;
+  Config.HostInputIndex = 0;
+  Config.TargetNames = {HostID, DeviceID};
+  Config.InputFileNames = {std::string(HostFile), std::string(DeviceFile)};
+  Config.OutputFileNames = {std::string(BundleFile)};
+  if (llvm::Error Err = OffloadBundler(Config).BundleFiles())
+    return std::move(Err);
+
+  auto BundleBuf = llvm::MemoryBuffer::getFile(BundleFile, /*IsText=*/false);
+  if (!BundleBuf)
+    return llvm::make_error<llvm::StringError>(
+        "Failed to read the offload bundle.", llvm::inconvertibleErrorCode());
+
+  llvm::StringRef Buffer = (*BundleBuf)->getBuffer();
+  BundleContent.assign(Buffer.begin(), Buffer.end());
+  return llvm::StringRef(BundleContent.data(), BundleContent.size());
+}
+
 llvm::Error IncrementalHIPDeviceParser::GenerateOffloadBinary() {
   llvm::Expected<llvm::StringRef> Object = GenerateDeviceObject();
   if (!Object)
@@ -141,7 +212,11 @@ llvm::Error IncrementalHIPDeviceParser::GenerateOffloadBinary() {
   if (!HSACO)
     return HSACO.takeError();
 
-  // FIXME: Bundle the HSACO and embed it into the host compilation.
+  llvm::Expected<llvm::StringRef> Bundle = GenerateBundle(*HSACO);
+  if (!Bundle)
+    return Bundle.takeError();
+
+  // FIXME: Embed the bundle into the host compilation.
   return llvm::make_error<llvm::StringError>(
       "HIP offload binary generation is not supported yet.",
       llvm::inconvertibleErrorCode());
